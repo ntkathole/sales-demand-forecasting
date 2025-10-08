@@ -1,20 +1,23 @@
 """
-Data Download and Preparation Script for Sales Demand Forecasting
+Data Download and Feature Engineering Script for Sales Demand Forecasting
 
-This script downloads the REAL Walmart sales dataset from Kaggle and prepares it for Feast.
+This script downloads the Walmart sales dataset from Kaggle and performs feature engineering.
 
-The Walmart dataset (from Kaggle competition: walmart-recruiting-store-sales-forecasting) contains:
+What it does:
+✅ Downloads CSVs from Kaggle (train.csv, features.csv, stores.csv)
+✅ Computes time-series features (lags, rolling averages, rolling std)
+✅ Merges external factors and store metadata
+✅ Converts to Parquet format for Feast
 
-Files:
-- train.csv: 421,570 records with Store, Dept, Date, Weekly_Sales, IsHoliday
-- features.csv: Store-level features with Temperature, Fuel_Price, MarkDown1-5, CPI, Unemployment  
-- stores.csv: Store metadata with Type (A/B/C) and Size
+Feature Engineering:
+- Lag features: sales_lag_1, sales_lag_2, sales_lag_4 (previous weeks)
+- Rolling means: sales_rolling_mean_4, sales_rolling_mean_12 (moving averages)
+- Rolling std: sales_rolling_std_4 (volatility measure)
 
-Dataset Details:
-- 45 stores across different regions
-- 99 departments per store (1-99, but not all stores have all departments)
-- Sales data from 2010-02-05 to 2012-11-01
-- 143 weeks of historical data
+The Walmart dataset contains:
+- 421,570 sales records (45 stores, 99 departments, 143 weeks)
+- External factors: Temperature, Fuel_Price, CPI, Unemployment, Markdowns
+- Store metadata: Type (A/B/C), Size
 
 Usage:
     python download_data.py
@@ -227,15 +230,19 @@ def load_and_explore_data(data_dir):
 
 def create_feature_datasets(train_df, features_df, stores_df, data_dir):
     """
-    Transform raw Walmart data into feature datasets for Feast.
+    Convert raw Walmart CSVs to Parquet files for Feast.
     
-    This creates parquet files optimized for Feast feature views:
-    - sales_features.parquet: Historical sales with time series features
-    - store_features.parquet: Store-level external factors
-    - store_metadata.parquet: Store characteristics
+    This function performs feature engineering and data preparation:
+    - Sales: Compute time-series features (lags, rolling averages, rolling std)
+    - Store features: Merge features.csv + stores.csv, broadcast to store+dept level
+    - Convert to parquet format
+    
+    Output files:
+    - sales_features.parquet: Sales data with pre-computed time-series features
+    - store_features.parquet: External factors (temperature, CPI, etc.) at store+dept level
     """
     print("="*70)
-    print("CREATING FEAST FEATURE DATASETS")
+    print("FEATURE ENGINEERING & DATA PREPARATION")
     print("="*70)
     print()
     
@@ -243,54 +250,61 @@ def create_feature_datasets(train_df, features_df, stores_df, data_dir):
     train_df['Date'] = pd.to_datetime(train_df['Date'])
     features_df['Date'] = pd.to_datetime(features_df['Date'])
     
-    # Create composite entity key: store_dept
-    train_df['store_dept'] = train_df['Store'].astype(str) + '_' + train_df['Dept'].astype(str)
+    # ===== 1. SALES DATA WITH TIME-SERIES FEATURES =====
+    print("📊 Computing time-series features for sales data...")
     
-    # ===== 1. SALES HISTORY FEATURES =====
-    print("📊 Creating sales history features...")
+    # Prepare base data
+    train_df = train_df.sort_values(['Store', 'Dept', 'Date'])
     
-    # Sort for time series operations
-    train_df = train_df.sort_values(['store_dept', 'Date'])
+    # Compute time-series features for each store-dept combination
+    sales_features_list = []
+    total_combinations = train_df[['Store', 'Dept']].drop_duplicates().shape[0]
     
-    # Calculate time series features
-    sales_features = []
-    for store_dept in train_df['store_dept'].unique():
-        dept_df = train_df[train_df['store_dept'] == store_dept].copy()
+    print(f"   Processing {total_combinations} store-dept combinations...")
+    
+    for idx, (store_dept, group) in enumerate(train_df.groupby(['Store', 'Dept']), 1):
+        if idx % 100 == 0:
+            print(f"   Progress: {idx}/{total_combinations} combinations processed...")
         
-        # Lag features (previous weeks)
-        dept_df['sales_lag_1'] = dept_df['Weekly_Sales'].shift(1)
-        dept_df['sales_lag_2'] = dept_df['Weekly_Sales'].shift(2)
-        dept_df['sales_lag_4'] = dept_df['Weekly_Sales'].shift(4)
+        group = group.sort_values('Date').copy()
         
-        # Rolling statistics (moving averages)
-        dept_df['sales_rolling_mean_4'] = dept_df['Weekly_Sales'].rolling(window=4, min_periods=1).mean()
-        dept_df['sales_rolling_mean_12'] = dept_df['Weekly_Sales'].rolling(window=12, min_periods=1).mean()
-        dept_df['sales_rolling_std_4'] = dept_df['Weekly_Sales'].rolling(window=4, min_periods=1).std().fillna(0)
+        # Lag features (previous weeks' sales)
+        group['sales_lag_1'] = group['Weekly_Sales'].shift(1)
+        group['sales_lag_2'] = group['Weekly_Sales'].shift(2)
+        group['sales_lag_4'] = group['Weekly_Sales'].shift(4)
         
-        # Trend indicator
-        dept_df['sales_trend'] = dept_df['Weekly_Sales'] - dept_df['sales_rolling_mean_4']
+        # Rolling mean features (moving averages)
+        group['sales_rolling_mean_4'] = group['Weekly_Sales'].rolling(window=4, min_periods=1).mean()
+        group['sales_rolling_mean_12'] = group['Weekly_Sales'].rolling(window=12, min_periods=1).mean()
         
-        sales_features.append(dept_df)
+        # Rolling standard deviation (volatility measure)
+        group['sales_rolling_std_4'] = group['Weekly_Sales'].rolling(window=4, min_periods=1).std().fillna(0)
+        
+        sales_features_list.append(group)
     
-    sales_df = pd.concat(sales_features, ignore_index=True)
+    sales_df = pd.concat(sales_features_list, ignore_index=True)
     
-    # Fill NaN values from shift operations
-    sales_df = sales_df.fillna(0)
+    # Rename columns to Feast convention
+    sales_feast_df = sales_df.rename(columns={
+        'Store': 'store',
+        'Dept': 'dept',
+        'Date': 'date',
+        'Weekly_Sales': 'weekly_sales',
+        'IsHoliday': 'is_holiday'
+    })
     
-    # Select and rename columns for Feast
-    sales_feast_df = sales_df[[
-        'store_dept', 'Date', 'Weekly_Sales', 'IsHoliday',
+    # Select final columns
+    sales_feast_df = sales_feast_df[[
+        'store', 'dept', 'date', 'weekly_sales', 'is_holiday',
         'sales_lag_1', 'sales_lag_2', 'sales_lag_4',
-        'sales_rolling_mean_4', 'sales_rolling_mean_12', 
-        'sales_rolling_std_4', 'sales_trend'
-    ]].copy()
-    
-    sales_feast_df = sales_feast_df.rename(columns={'Date': 'date', 'Weekly_Sales': 'weekly_sales', 'IsHoliday': 'is_holiday'})
+        'sales_rolling_mean_4', 'sales_rolling_mean_12', 'sales_rolling_std_4'
+    ]]
     
     # Save to parquet
     output_path = data_dir / 'sales_features.parquet'
     sales_feast_df.to_parquet(output_path, index=False)
-    print(f"   ✅ Saved {len(sales_feast_df):,} records to sales_features.parquet")
+    print(f"   ✅ Saved {len(sales_feast_df):,} sales records with computed features")
+    print(f"   ✅ Features: lags (1,2,4 weeks), rolling means (4,12 weeks), rolling std (4 weeks)")
     
     # ===== 2. STORE-LEVEL EXTERNAL FEATURES =====
     print("🌡️  Creating store-level external features...")
@@ -298,15 +312,15 @@ def create_feature_datasets(train_df, features_df, stores_df, data_dir):
     # Merge features with stores metadata
     store_features_df = features_df.merge(stores_df, on='Store', how='left')
     
-    # Create store_dept combinations (broadcast store features to all depts)
-    # Get unique store_dept from training data
-    unique_store_depts = train_df[['Store', 'Dept', 'store_dept']].drop_duplicates()
+    # Create store+dept combinations (broadcast store features to all depts)
+    # Get unique store+dept from training data
+    unique_store_depts = train_df[['Store', 'Dept']].drop_duplicates()
     
-    # Expand store features to store_dept level
+    # Expand store features to store+dept level
     store_expanded = []
     for _, row in unique_store_depts.iterrows():
         store_data = store_features_df[store_features_df['Store'] == row['Store']].copy()
-        store_data['store_dept'] = row['store_dept']
+        store_data['Dept'] = row['Dept']
         store_expanded.append(store_data)
     
     store_expanded_df = pd.concat(store_expanded, ignore_index=True)
@@ -325,13 +339,15 @@ def create_feature_datasets(train_df, features_df, stores_df, data_dir):
     
     # Select columns for Feast
     store_feast_df = store_expanded_df[[
-        'store_dept', 'Date', 'Temperature', 'Fuel_Price', 'CPI', 'Unemployment',
+        'Store', 'Dept', 'Date', 'Temperature', 'Fuel_Price', 'CPI', 'Unemployment',
         'MarkDown1', 'MarkDown2', 'MarkDown3', 'MarkDown4', 'MarkDown5',
         'total_markdown', 'has_markdown', 'Type', 'Size'
     ]].copy()
     
     # Rename columns to lowercase
     store_feast_df = store_feast_df.rename(columns={
+        'Store': 'store',
+        'Dept': 'dept',
         'Date': 'date',
         'Temperature': 'temperature',
         'Fuel_Price': 'fuel_price',
@@ -353,20 +369,22 @@ def create_feature_datasets(train_df, features_df, stores_df, data_dir):
     
     print()
     print("="*70)
-    print("✅ FEATURE DATASETS CREATED SUCCESSFULLY!")
+    print("✅ FEATURE ENGINEERING COMPLETE!")
     print("="*70)
     print()
     print("Files created:")
     print(f"  📁 {data_dir}/sales_features.parquet")
+    print(f"     • Base: weekly_sales, is_holiday")
+    print(f"     • Lags: sales_lag_1, sales_lag_2, sales_lag_4")
+    print(f"     • Rolling: sales_rolling_mean_4, sales_rolling_mean_12, sales_rolling_std_4")
     print(f"  📁 {data_dir}/store_features.parquet")
+    print(f"     • External factors: temperature, CPI, fuel_price, etc.")
     print()
-    print("Feature datasets are ready for Feast!")
+    print("✨ Features ready for Feast!")
     print()
     print("Next steps:")
-    print("  1. cd feature_repo")
-    print("  2. feast apply")
-    print("  3. cd ..")
-    print("  4. python demo.py")
+    print("  1. cd feature_repo && feast apply")
+    print("  2. cd .. && python demo.py")
     print()
 
 
