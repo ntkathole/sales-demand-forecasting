@@ -6,6 +6,9 @@ A major retail chain transforms sales demand forecasting across multiple stores/
 
 This example demonstrates **Feature Store for production ML feature serving** using real Walmart sales data. 
 
+https://github.com/user-attachments/assets/b51e25ed-7a69-48fe-92c8-823bdb48a139
+
+
 ### Business Context
 
 **Use Case**: Major retail chain transforms sales demand forecasting using LightGBM + Time Series Features
